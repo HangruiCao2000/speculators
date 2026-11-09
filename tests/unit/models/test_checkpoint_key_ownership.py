@@ -170,3 +170,16 @@ def test_checkpoint_weights_take_precedence(monkeypatch: pytest.MonkeyPatch):
 
     assert torch.equal(model.embed_tokens.weight, expected_embed)
     assert torch.equal(model.lm_head.weight, expected_head)
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [DFlashDraftModel, DSparkDraftModel],
+    ids=["dflash", "dspark"],
+)
+def test_bias_carrying_verifier_norm_is_verifier_owned(model_cls, tmp_path: Path):
+    """A verifier_norm bias belongs to the verifier, like its weight."""
+    model = _make_model(model_cls, draft_vocab_size=VERIFIER_VOCAB)
+    model.verifier_norm = nn.LayerNorm(16, eps=1e-6)
+    assert "verifier_norm.bias" not in _saved_keys(model, tmp_path)
+    assert "verifier_norm.bias" in model._keys_to_ignore_on_load_missing

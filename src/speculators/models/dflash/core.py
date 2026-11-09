@@ -43,6 +43,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
         "verifier_norm.weight",
+        "verifier_norm.bias",
         # verifier_lm_head is reloaded from the verifier (see load_verifier_weights)
         # and excluded on save, so it is expected to be absent from checkpoints.
         # lm_head is handled per-instance in __init__: omitted only for full-vocab
@@ -54,6 +55,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
         "verifier_lm_head.weight",
         "verifier_norm.weight",
+        "verifier_norm.bias",
     ]
 
     t2d: torch.Tensor | None
