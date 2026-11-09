@@ -17,6 +17,8 @@ from typing import cast
 
 import pytest
 import torch
+from safetensors.torch import save_file
+from torch import nn
 from transformers import LlamaConfig
 from transformers.models.gemma3.modeling_gemma3 import Gemma3RMSNorm
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
@@ -280,3 +282,90 @@ def test_custom_code_verifier_resolves_without_trust_remote_code(
     monkeypatch.setattr("speculators.models.utils.AutoConfig.from_pretrained", _refuse)
 
     assert _verifier_model_type(str(verifier_dir)) == "gemma3"
+def _write_fake_verifier_checkpoint(path, norm_keys: dict[str, torch.Tensor]):
+    """Write a plain-convention verifier whose final norm uses ``norm_keys``."""
+    path.mkdir(parents=True)
+    (path / "config.json").write_text(json.dumps({"model_type": "nemotron_parse"}))
+    save_file(
+        {
+            "decoder.embed_tokens.weight": torch.randn(64, 16),
+            "decoder.layers.0.final_layer_norm.weight": torch.randn(16),
+            "encoder.layer_norm1.weight": torch.randn(16),
+            **norm_keys,
+        },
+        path / "model.safetensors",
+    )
+
+
+def test_mbart_style_verifier_loads_final_norm_weight_and_bias(tmp_path):
+    """An mBART-style verifier's ``decoder.layer_norm`` loads, bias included."""
+    norm_keys = {
+        "decoder.layer_norm.weight": torch.randn(16),
+        "decoder.layer_norm.bias": torch.randn(16),
+    }
+    _write_fake_verifier_checkpoint(tmp_path / "verifier", norm_keys)
+    model = _make_model(DFlashDraftModel, draft_vocab_size=64)
+    model.config.speculators_config.verifier.name_or_path = str(tmp_path / "verifier")
+    model.verifier_norm = nn.LayerNorm(16, eps=1e-6)
+
+    model.load_verifier_weights()
+
+    assert torch.equal(
+        model.verifier_norm.weight, norm_keys["decoder.layer_norm.weight"]
+    )
+    assert torch.equal(model.verifier_norm.bias, norm_keys["decoder.layer_norm.bias"])
+    assert not model.verifier_norm.weight.requires_grad
+    assert not model.verifier_norm.bias.requires_grad
+
+
+def test_rms_norm_verifier_norm_ignores_a_checkpoint_bias(tmp_path):
+    """A bias-free norm class loads the weight and leaves the bias alone."""
+    norm_keys = {
+        "decoder.layer_norm.weight": torch.randn(16),
+        "decoder.layer_norm.bias": torch.randn(16),
+    }
+    _write_fake_verifier_checkpoint(tmp_path / "verifier", norm_keys)
+    model = _make_model(DFlashDraftModel, draft_vocab_size=64)
+    model.config.speculators_config.verifier.name_or_path = str(tmp_path / "verifier")
+    assert isinstance(model.verifier_norm, Qwen3RMSNorm)
+
+    model.load_verifier_weights()
+
+    assert torch.equal(
+        model.verifier_norm.weight, norm_keys["decoder.layer_norm.weight"]
+    )
+    assert not hasattr(model.verifier_norm, "bias")
+
+
+@pytest.mark.parametrize(
+    "weight_key",
+    ["model.norm.weight", "decoder.layer_norm.weight", "transformer.ln_f.weight"],
+)
+def test_final_norm_weight_key_candidates_resolve(
+    monkeypatch: pytest.MonkeyPatch, weight_key: str
+):
+    """Each supported final-norm layout reaches ``verifier_norm``."""
+    fake = _fake_verifier()
+    del fake["model.norm.weight"]
+    fake[weight_key] = torch.randn(16)
+    model = _make_model(DFlashDraftModel, draft_vocab_size=64)
+    monkeypatch.setattr(
+        "speculators.utils.loading.load_model_layers", _make_fake_loader(fake)
+    )
+
+    model.load_verifier_weights()
+
+    assert torch.equal(model.verifier_norm.weight, fake[weight_key])
+
+
+def test_unresolvable_final_norm_raises(monkeypatch: pytest.MonkeyPatch):
+    """A verifier with no recognised final-norm key must stop the load."""
+    fake = _fake_verifier()
+    del fake["model.norm.weight"]
+    model = _make_model(DFlashDraftModel, draft_vocab_size=64)
+    monkeypatch.setattr(
+        "speculators.utils.loading.load_model_layers", _make_fake_loader(fake)
+    )
+
+    with pytest.raises(ValueError, match="Could not find the final norm weight"):
+        model.load_verifier_weights()

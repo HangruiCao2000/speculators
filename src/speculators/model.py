@@ -16,6 +16,19 @@ from transformers import PretrainedConfig, PreTrainedModel
 from speculators.config import SpeculatorModelConfig
 from speculators.utils import ClassRegistryMixin
 
+# Most specific first; load_model_layers suffix-matches each, shortest key wins.
+VERIFIER_FINAL_NORM_WEIGHT_KEYS = (
+    "decoder.layer_norm.weight",
+    "model.decoder.layer_norm.weight",
+    "transformer.ln_f.weight",
+    "model.norm.weight",
+    "norm.weight",
+)
+
+
+def _bias_key(weight_key: str) -> str:
+    return f"{weight_key.removesuffix('.weight')}.bias"
+
 
 class DraftVocabMixin(nn.Module):
     """
@@ -139,8 +152,6 @@ class DraftVocabMixin(nn.Module):
         weights take precedence unless an internal caller explicitly requests
         overwrite.
         """
-        import warnings  # noqa: PLC0415
-
         from speculators.utils.loading import load_model_layers  # noqa: PLC0415
 
         speculators_config = getattr(
@@ -155,7 +166,11 @@ class DraftVocabMixin(nn.Module):
         # Determine which weights to load based on model attributes
         weights_to_load = ["embed_tokens.weight", "lm_head.weight"]
         if hasattr(self, "verifier_norm"):
-            weights_to_load.append("model.norm.weight")
+            weights_to_load.extend(VERIFIER_FINAL_NORM_WEIGHT_KEYS)
+            if getattr(self.verifier_norm, "bias", None) is not None:
+                weights_to_load.extend(
+                    _bias_key(key) for key in VERIFIER_FINAL_NORM_WEIGHT_KEYS
+                )
 
         verifier_weights = load_model_layers(
             weights_to_load,
@@ -195,19 +210,8 @@ class DraftVocabMixin(nn.Module):
             {"weight": lm_head_weight.detach().clone()}, strict=False
         )
 
-        # Load verifier norm weights if the model has verifier_norm
         if hasattr(self, "verifier_norm"):
-            if "model.norm.weight" not in verifier_weights:
-                warnings.warn(
-                    f"Could not find final norm weights in "
-                    f"{verifier_config.name_or_path}. "
-                    "Using default initialization (weight=1.0).",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            else:
-                verifier_norm_sd = {"weight": verifier_weights["model.norm.weight"]}
-                self.verifier_norm.load_state_dict(verifier_norm_sd)  # type: ignore[union-attr]
+            self._load_verifier_norm(verifier_weights, verifier_config.name_or_path)
 
         # HF's from_pretrained resets requires_grad=True on all parameters.
         # Re-freeze verifier weights that should never be trained.
@@ -216,6 +220,38 @@ class DraftVocabMixin(nn.Module):
         self.verifier_lm_head.weight.requires_grad_(False)
         if hasattr(self, "verifier_norm"):
             self.verifier_norm.weight.requires_grad_(False)  # type: ignore[union-attr]
+            if getattr(self.verifier_norm, "bias", None) is not None:
+                self.verifier_norm.bias.requires_grad_(False)  # type: ignore[union-attr]
+
+    def _load_verifier_norm(
+        self, verifier_weights: dict[str, torch.Tensor], name_or_path: str
+    ) -> None:
+        """Load the verifier's frozen final norm, whatever its checkpoint layout.
+
+        Raises instead of defaulting to weight=1.0, which is invisible until serving.
+        """
+        weight_key = next(
+            (key for key in VERIFIER_FINAL_NORM_WEIGHT_KEYS if key in verifier_weights),
+            None,
+        )
+        if weight_key is None:
+            raise ValueError(
+                f"Could not find the final norm weight of verifier {name_or_path}. "
+                f"Tried {', '.join(VERIFIER_FINAL_NORM_WEIGHT_KEYS)}. "
+                "verifier_norm rebuilds the training targets, so it cannot be left "
+                "at its default weight=1.0. Add this verifier's final-norm key to "
+                "speculators.model.VERIFIER_FINAL_NORM_WEIGHT_KEYS, or point "
+                "verifier.name_or_path at a checkpoint that carries the norm."
+            )
+        verifier_norm_sd = {"weight": verifier_weights[weight_key]}
+        bias_key = _bias_key(weight_key)
+        if (
+            getattr(self.verifier_norm, "bias", None) is not None  # type: ignore[union-attr]
+            and bias_key in verifier_weights
+        ):
+            verifier_norm_sd["bias"] = verifier_weights[bias_key]
+        # Not strict: an RMSNorm has no bias, and a LayerNorm verifier may ship none.
+        self.verifier_norm.load_state_dict(verifier_norm_sd, strict=False)  # type: ignore[union-attr]
 
 
 class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc]

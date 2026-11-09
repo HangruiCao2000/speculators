@@ -32,6 +32,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
         "verifier_norm.weight",
+        "verifier_norm.bias",
         "verifier_lm_head.weight",
         "d2t",
         "t2d",
@@ -40,6 +41,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
     _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
         "verifier_lm_head.weight",
         "verifier_norm.weight",
+        "verifier_norm.bias",
     ]
 
     t2d: torch.Tensor | None

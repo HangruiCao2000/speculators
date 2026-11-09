@@ -40,6 +40,7 @@ _VERIFIER_FILLED_KEYS = frozenset(
         "lm_head.weight",
         "verifier_lm_head.weight",
         "verifier_norm.weight",
+        "verifier_norm.bias",
         "t2d",
         "d2t",
     }
