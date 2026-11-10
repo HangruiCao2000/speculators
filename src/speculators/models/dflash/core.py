@@ -26,6 +26,8 @@ from speculators.models.utils import (
     flatten_rope_parameters,
     resolve_target_layer_ids,
     resolve_verifier_norm_class,
+    resolve_verifier_norm_eps,
+    resolve_verifier_norm_width,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,8 +131,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm = resolve_verifier_norm_class(config)(
-            config.transformer_layer_config.hidden_size,
-            eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
+            resolve_verifier_norm_width(config),
+            eps=resolve_verifier_norm_eps(config),
         )
         self.verifier_norm.weight.requires_grad = False
         self.block_size = config.block_size

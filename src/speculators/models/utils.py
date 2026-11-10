@@ -4,9 +4,12 @@ from copy import deepcopy
 from functools import cache, partial
 
 import torch
+from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.gemma3.modeling_gemma3 import Gemma3RMSNorm
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+from speculators.utils.loading import list_checkpoint_keys
 
 logger = logging.getLogger(__name__)
 
@@ -59,17 +62,102 @@ def uses_gemma_style_final_norm(config) -> bool:
     return model_type is not None and model_type in GEMMA_STYLE_FINAL_NORM_MODEL_TYPES
 
 
-def resolve_verifier_norm_class(config) -> type:
-    """The RMSNorm class matching the verifier's final-norm weight convention.
+# Nested keys under which a multimodal verifier hides its text config.
+_TEXT_CONFIG_KEYS = ("text_config", "decoder", "llm_config", "language_config")
+_EPS_CONFIG_KEYS = ("layer_norm_eps", "layer_norm_epsilon", "rms_norm_eps")
 
-    The frozen ``verifier_norm`` must apply the same gain convention the
-    verifier was trained under (`x * (1 + w)` for the Gemma, Qwen3.5,
-    Qwen3-Next and Step3.5 families, `x * w` otherwise), or the
-    reconstructed verifier targets are silently mis-scaled.
+
+@cache
+def _verifier_text_config_dict(name_or_path: str) -> dict:
+    """The verifier's effective text config as a plain dict, or {} when unreadable.
+
+    get_config_dict needs no trust_remote_code, unlike AutoConfig on an auto_map verifier.
     """
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(name_or_path)
+    except (KeyError, OSError, ValueError) as err:
+        logger.warning(
+            "Could not read a config.json for verifier %s (%s): %s.",
+            name_or_path,
+            type(err).__name__,
+            err,
+        )
+        return {}
+    for key in _TEXT_CONFIG_KEYS:
+        nested = config_dict.get(key)
+        if isinstance(nested, dict):
+            return nested
+    return config_dict
+
+
+@cache
+def _verifier_final_norm_has_bias(name_or_path: str) -> bool:
+    """Whether the verifier ships a bias beside its final-norm weight.
+
+    Read from the checkpoint keys, not a model_type allowlist: a bias is what makes the
+    norm a LayerNorm, and nparse ships no layer_norm_eps to key off.
+    """
+    from speculators.model import VERIFIER_FINAL_NORM_WEIGHT_KEYS, _bias_key
+
+    try:
+        keys = set(list_checkpoint_keys(name_or_path))
+    except (OSError, ValueError, KeyError) as err:
+        logger.warning(
+            "Could not list checkpoint keys for verifier %s (%s): %s. Assuming its "
+            "final norm is an RMSNorm; if it is a LayerNorm the reconstructed training "
+            "targets will be missing its bias.",
+            name_or_path,
+            type(err).__name__,
+            err,
+        )
+        return False
+    return any(_bias_key(key) in keys for key in VERIFIER_FINAL_NORM_WEIGHT_KEYS)
+
+
+def _verifier_name_or_path(config) -> str | None:
+    verifier = getattr(getattr(config, "speculators_config", None), "verifier", None)
+    return getattr(verifier, "name_or_path", None) or None
+
+
+def resolve_verifier_norm_class(config) -> type:
+    """The norm class matching the verifier's final norm.
+
+    ``nn.LayerNorm`` when the verifier ships a final-norm bias (mBART/BART/Whisper and
+    GPT-2-style layouts), otherwise the RMSNorm variant for its gain convention
+    (`x * (1 + w)` for the Gemma, Qwen3.5, Qwen3-Next and Step3.5 families, `x * w`
+    otherwise). Getting this wrong silently mis-scales every reconstructed target.
+    """
+    name_or_path = _verifier_name_or_path(config)
+    if name_or_path is not None and _verifier_final_norm_has_bias(name_or_path):
+        return nn.LayerNorm
     if uses_gemma_style_final_norm(config):
         return Gemma3RMSNorm
     return Qwen3RMSNorm
+
+
+def resolve_verifier_norm_eps(config) -> float:
+    """The verifier's own final-norm eps, falling back to the draft's."""
+    draft_eps = float(config.transformer_layer_config.rms_norm_eps)
+    name_or_path = _verifier_name_or_path(config)
+    if name_or_path is None:
+        return draft_eps
+    text_config = _verifier_text_config_dict(name_or_path)
+    for key in _EPS_CONFIG_KEYS:
+        value = text_config.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    # nparse ships no eps key at all, so fall back to nn.LayerNorm's own default.
+    if _verifier_final_norm_has_bias(name_or_path):
+        return 1e-5
+    return draft_eps
+
+
+def resolve_verifier_norm_width(config) -> int:
+    """The verifier's hidden size -- verifier_norm is applied to ITS hidden states."""
+    return int(
+        getattr(config, "target_hidden_size", None)
+        or config.transformer_layer_config.hidden_size
+    )
 
 
 def conditional_torch_compile(func=None, *args, **kwargs):
