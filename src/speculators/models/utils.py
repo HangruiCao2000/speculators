@@ -80,7 +80,7 @@ _EPS_CONFIG_KEYS = ("layer_norm_eps", "layer_norm_epsilon", "rms_norm_eps")
 def _verifier_text_config_dict(name_or_path: str) -> dict:
     """The verifier's effective text config as a plain dict, or {} when unreadable.
 
-    get_config_dict needs no trust_remote_code, unlike AutoConfig on an auto_map verifier.
+    get_config_dict needs no trust_remote_code, unlike AutoConfig on auto_map verifiers.
     """
     try:
         config_dict, _ = PretrainedConfig.get_config_dict(name_or_path)
@@ -106,7 +106,12 @@ def _verifier_final_norm_has_bias(name_or_path: str) -> bool:
     Read from the checkpoint keys, not a model_type allowlist: a bias is what makes the
     norm a LayerNorm, and nparse ships no layer_norm_eps to key off.
     """
-    from speculators.model import VERIFIER_FINAL_NORM_WEIGHT_KEYS, _bias_key
+    # Module-level would close a cycle: models/__init__ imports the cores, which import
+    # speculators.model.
+    from speculators.model import (  # noqa: PLC0415
+        VERIFIER_FINAL_NORM_WEIGHT_KEYS,
+        _bias_key,
+    )
 
     try:
         keys = set(list_checkpoint_keys(name_or_path))

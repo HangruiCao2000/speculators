@@ -322,6 +322,8 @@ def test_unresolvable_final_norm_raises(monkeypatch: pytest.MonkeyPatch):
 
     with pytest.raises(ValueError, match="Could not find the final norm weight"):
         model.load_verifier_weights()
+
+
 def test_custom_code_verifier_resolves_without_trust_remote_code(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):
