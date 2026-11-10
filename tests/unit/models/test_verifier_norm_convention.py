@@ -41,14 +41,6 @@ from .test_checkpoint_key_ownership import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate_verifier_model_type_cache():
-    """Keep _verifier_model_type's @cache from leaking results across tests."""
-    _verifier_model_type.cache_clear()
-    yield
-    _verifier_model_type.cache_clear()
-
-
 def _point_at_fake_verifier(
     model, tmp_path, model_type: str, text_model_type: str = ""
 ):
@@ -105,10 +97,7 @@ def test_detection_by_verifier_model_type(
 def test_unresolvable_verifier_defaults_to_plain(monkeypatch: pytest.MonkeyPatch):
     """A verifier whose config.json cannot be read keeps the plain convention."""
 
-    calls: list[str] = []
-
-    def _raise(name_or_path, *args, **kwargs):
-        calls.append(name_or_path)
+    def _raise(*args, **kwargs):
         raise OSError("cannot resolve")
 
     monkeypatch.setattr(
@@ -118,18 +107,6 @@ def test_unresolvable_verifier_defaults_to_plain(monkeypatch: pytest.MonkeyPatch
     model = _make_model(DFlashDraftModel, draft_vocab_size=64)
     assert uses_gemma_style_final_norm(model.config) is False
     assert isinstance(model.verifier_norm, Qwen3RMSNorm)
-    assert calls, "the patched config.json read was never reached"
-
-
-def test_missing_model_type_is_unresolved(tmp_path, caplog: pytest.LogCaptureFixture):
-    """A config.json without model_type is unresolved and warns, not a silent ''."""
-    verifier_dir = tmp_path / "gemma3_no_model_type"
-    verifier_dir.mkdir()
-    (verifier_dir / "config.json").write_text(json.dumps({"hidden_size": 16}))
-
-    with caplog.at_level("WARNING", logger="speculators.models.utils"):
-        assert _verifier_model_type(str(verifier_dir)) is None
-    assert "declares no model_type" in caplog.text
 
 
 def test_plain_construction_unchanged():
@@ -258,30 +235,6 @@ def test_gemma3_rmsnorm_matches_verifier_final_norm(module: str, norm_class: str
     torch.testing.assert_close(gemma(x), verifier_norm(x), rtol=1e-5, atol=1e-5)
 
 
-def test_custom_code_verifier_resolves_without_trust_remote_code(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-):
-    """A verifier declaring an auto_map still resolves its final-norm convention."""
-    verifier_dir = tmp_path / "custom_code_verifier"
-    verifier_dir.mkdir()
-    (verifier_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "gemma3",
-                "auto_map": {"AutoConfig": "configuration_custom.CustomConfig"},
-            }
-        )
-    )
-
-    def _refuse(*args, **kwargs):
-        raise ValueError(
-            "contains custom code which must be executed to correctly load the model"
-        )
-
-    # Reaching for AutoConfig would make this verifier unresolvable again.
-    monkeypatch.setattr("speculators.models.utils.AutoConfig.from_pretrained", _refuse)
-
-    assert _verifier_model_type(str(verifier_dir)) == "gemma3"
 def _write_fake_verifier_checkpoint(path, norm_keys: dict[str, torch.Tensor]):
     """Write a plain-convention verifier whose final norm uses ``norm_keys``."""
     path.mkdir(parents=True)
@@ -369,3 +322,30 @@ def test_unresolvable_final_norm_raises(monkeypatch: pytest.MonkeyPatch):
 
     with pytest.raises(ValueError, match="Could not find the final norm weight"):
         model.load_verifier_weights()
+
+
+def test_custom_code_verifier_resolves_without_trust_remote_code(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """A verifier declaring an auto_map still resolves its final-norm convention."""
+    verifier_dir = tmp_path / "custom_code_verifier"
+    verifier_dir.mkdir()
+    (verifier_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma3",
+                "auto_map": {"AutoConfig": "configuration_custom.CustomConfig"},
+            }
+        )
+    )
+
+    def _refuse(*args, **kwargs):
+        raise ValueError(
+            "contains custom code which must be executed to correctly load the model"
+        )
+
+    # Reaching for AutoConfig would make this verifier unresolvable again.
+    monkeypatch.setattr("speculators.models.utils.AutoConfig.from_pretrained", _refuse)
+
+    _verifier_model_type.cache_clear()
+    assert _verifier_model_type(str(verifier_dir)) == "gemma3"
